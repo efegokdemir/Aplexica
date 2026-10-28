@@ -229,6 +229,37 @@ func TestDoctorCmd_JSONLogHeadingCannotReplaceReportSection(t *testing.T) {
 	require.NotContains(t, report.Sections, "forged section")
 }
 
+func TestDoctorCmd_JSONOutputRemainsValidWhenLogTailNeedsEscaping(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PROGRAMDATA", t.TempDir())
+	require.NoError(t, os.MkdirAll(filepath.Join(home, ".aplexica"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(home, ".aplexica", "config.toml"),
+		[]byte("[log]\ndoctor_tail_bytes = 1048576\n"), 0o600))
+
+	tmp := t.TempDir()
+	storeRoot := filepath.Join(tmp, "store")
+	require.NoError(t, (&acf.Store{Root: storeRoot}).Init())
+	logPath := filepath.Join(tmp, "daemon.log")
+	require.NoError(t, os.WriteFile(logPath, bytes.Repeat([]byte{0}, 1<<20), 0o600))
+
+	out, err := runDoctorCmd(t,
+		"--format", "json",
+		"--store", storeRoot,
+		"--secrets-root", filepath.Join(tmp, "secrets"),
+		"--state-dir", filepath.Join(tmp, "state"),
+		"--log", logPath,
+	)
+	require.NoError(t, err)
+
+	var report struct {
+		Truncated bool `json:"truncated"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(out), &report), "capped JSON output must remain valid JSON")
+	require.True(t, report.Truncated)
+	require.LessOrEqual(t, len(out), doctorMaxBytes)
+}
+
 func TestDoctorCmd_WritesToOutFile(t *testing.T) {
 	tmp := t.TempDir()
 	storeRoot := filepath.Join(tmp, "store")
