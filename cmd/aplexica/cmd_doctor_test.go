@@ -283,6 +283,7 @@ func TestDoctorCmd_JSONLogHeadingCannotReplaceReportSection(t *testing.T) {
 func TestDoctorCmd_JSONOutputRemainsValidWhenLogTailNeedsEscaping(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("PROGRAMDATA", t.TempDir())
 	require.NoError(t, os.MkdirAll(filepath.Join(home, ".aplexica"), 0o700))
 	require.NoError(t, os.WriteFile(filepath.Join(home, ".aplexica", "config.toml"),
