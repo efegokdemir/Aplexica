@@ -88,8 +88,8 @@ func TestClassifierRecognizesHomebrewKegWhenTheFormulaProbeFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if installation.Method != MethodHomebrew || installation.ChannelEnabled ||
-		installation.ManagerCommand != "brew upgrade aplexica" {
+	if installation.Method != MethodHomebrew || !installation.ChannelEnabled ||
+		installation.ManagerCommand != "brew update && brew upgrade aplexica" {
 		t.Fatalf("keg under the Homebrew prefix classified as %+v", installation)
 	}
 }
@@ -171,6 +171,23 @@ func TestClassifierTreatsAnOrdinaryMakeBuildAsSource(t *testing.T) {
 	}
 	if installation.Method != MethodSource {
 		t.Fatalf("ordinary Makefile build classified as %+v", installation)
+	}
+}
+
+func TestClassifierTreatsSourceBuildWithPopulatedGitCommitAsMethodSource(t *testing.T) {
+	executable := filepath.Join(t.TempDir(), "aplexica")
+	installation, err := (Classifier{Runner: fakeRunner(func(string, ...string) ([]byte, error) {
+		return nil, fmt.Errorf("not installed")
+	})}).Classify(t.Context(), executable, Provenance{
+		Version:      "v1.0.74",
+		GitCommit:    "0123456789abcdef0123456789abcdef01234567",
+		ReleaseTrain: "",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installation.Method != MethodSource {
+		t.Fatalf("source build with populated GitCommit classified as %+v, want MethodSource", installation)
 	}
 }
 

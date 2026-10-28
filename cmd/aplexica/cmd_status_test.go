@@ -15,6 +15,7 @@ import (
 	"github.com/aplexica/aplexica/internal/acf"
 	"github.com/aplexica/aplexica/internal/conflicts"
 	"github.com/aplexica/aplexica/internal/daemon"
+	syncd "github.com/aplexica/aplexica/internal/sync"
 )
 
 func TestQueryDaemonStatus_SyncEvidenceIsOptIn(t *testing.T) {
@@ -299,6 +300,69 @@ func TestRenderStorePressure_OverEmergencyWarnsRefusal(t *testing.T) {
 	}
 }
 
+// A blocked adapter syncs nothing while every other indicator looks
+// healthy: the daemon runs, the agent reads as installed, and its artifact
+// count just stays at zero. The block has to be stated in the default
+// output, or the only evidence is a line in the daemon log.
+func TestRenderAdapterBlocks_NamesTheBlockAndTheRemedy(t *testing.T) {
+	var buf bytes.Buffer
+	renderAdapterBlocks(&buf, &daemon.StatusInfo{
+		AdapterBlocked: map[string]string{
+			"claude-code": `nativebackup: snapshot agent "claude-code" root ~/.claude: privatefs: unsafe directory permissions 0775`,
+		},
+	})
+	out := buf.String()
+	if !strings.Contains(out, "WARNING") {
+		t.Errorf("a block the operator did not ask for must warn, got %q", out)
+	}
+	for _, want := range []string{"claude-code", "unsafe directory permissions 0775", "chmod 700"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in the block report, got %q", want, out)
+		}
+	}
+}
+
+func TestRenderAdapterBlocks_EmptyIsQuiet(t *testing.T) {
+	var buf bytes.Buffer
+	renderAdapterBlocks(&buf, &daemon.StatusInfo{})
+	if buf.Len() != 0 {
+		t.Errorf("no blocked adapters must render nothing, got %q", buf.String())
+	}
+}
+
+// A reason with no shipped remedy must print the reason alone rather than a
+// command that repairs nothing.
+func TestRenderAdapterBlocks_UnknownReasonPrintsNoCommand(t *testing.T) {
+	var buf bytes.Buffer
+	renderAdapterBlocks(&buf, &daemon.StatusInfo{
+		AdapterBlocked: map[string]string{"codex": "some future condition"},
+	})
+	out := buf.String()
+	if !strings.Contains(out, "some future condition") {
+		t.Errorf("the reason must still be named, got %q", out)
+	}
+	if strings.Contains(out, "Fix with:") {
+		t.Errorf("must not offer a remedy it does not have, got %q", out)
+	}
+}
+
+// Ordering must be stable so the line does not shuffle between polls in
+// `status --watch`.
+func TestRenderAdapterBlocks_IsDeterministicallyOrdered(t *testing.T) {
+	info := &daemon.StatusInfo{AdapterBlocked: map[string]string{
+		"openclaw": "r", "claude-code": "r", "kilo": "r", "codex": "r",
+	}}
+	var first bytes.Buffer
+	renderAdapterBlocks(&first, info)
+	for i := 0; i < 8; i++ {
+		var again bytes.Buffer
+		renderAdapterBlocks(&again, info)
+		if again.String() != first.String() {
+			t.Fatalf("block ordering must be stable across renders:\n%q\n%q", first.String(), again.String())
+		}
+	}
+}
+
 func TestRenderDeferredMaterializations_EmptyIsQuiet(t *testing.T) {
 	var buf bytes.Buffer
 	renderDeferredMaterializations(&buf, &daemon.StatusInfo{})
@@ -320,6 +384,53 @@ func TestRenderDeferredMaterializations_PendingIsNotAWarning(t *testing.T) {
 	}
 	if !strings.Contains(out, "1 pending retry") {
 		t.Errorf("expected a pending retry count, got %q", out)
+	}
+}
+
+// A write held by a policy gate the operator set — an agent they chose not to
+// enable — is not a retry and must not be counted as one. The queue holds it on
+// purpose so it lands if that agent is ever enabled, so on a device with a
+// scoped rule the "pending" count would otherwise be the whole store and read
+// as a fault.
+func TestRenderDeferredMaterializations_PolicyHeldIsNotCountedAsARetry(t *testing.T) {
+	var buf bytes.Buffer
+	renderDeferredMaterializations(&buf, &daemon.StatusInfo{
+		DeferredMaterializations: []map[string]any{
+			{"agent": "openclaw", "artifactId": "a1", "state": "pending", "attempts": 0,
+				"reason": string(syncd.ReasonTargetSyncDisabled)},
+			{"agent": "kilo", "artifactId": "a2", "state": "pending", "attempts": 0,
+				"reason": string(syncd.ReasonTargetSyncDisabled)},
+			{"agent": "codex", "artifactId": "a3", "state": "pending", "attempts": 3},
+		},
+	})
+	out := buf.String()
+	if !strings.Contains(out, "1 pending retry") {
+		t.Errorf("only the genuinely retrying write counts as a retry, got %q", out)
+	}
+	if !strings.Contains(out, "2 writes waiting on agents you have not enabled") {
+		t.Errorf("policy-held writes must be named as configuration, got %q", out)
+	}
+	if !strings.Contains(out, "aplexica sync enable") {
+		t.Errorf("the operator must be told the action, got %q", out)
+	}
+	if strings.Contains(out, "WARNING") {
+		t.Errorf("the operator's own configuration is not a warning, got %q", out)
+	}
+}
+
+// An uncatalogued reason classifies as a defect, so it must still be reported
+// as a real retry rather than quietly folded into the policy line.
+func TestRenderDeferredMaterializations_UnknownReasonStaysARetry(t *testing.T) {
+	var buf bytes.Buffer
+	renderDeferredMaterializations(&buf, &daemon.StatusInfo{
+		DeferredMaterializations: []map[string]any{
+			{"agent": "codex", "artifactId": "a1", "state": "pending", "attempts": 1,
+				"reason": "some_future_reason"},
+		},
+	})
+	out := buf.String()
+	if !strings.Contains(out, "1 pending retry") {
+		t.Errorf("an unrecognized reason must not be hidden as policy, got %q", out)
 	}
 }
 

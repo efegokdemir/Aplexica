@@ -37,6 +37,13 @@ aplexica sync enable --all
 aplexica daemon reload
 ```
 
+`--all` enables every installed agent at once. If one of them is running right
+now, close it first, or name only the agents you want with
+`aplexica sync enable codex claude-code` — an agent that keeps its history in a
+database reads it at startup, so writing to it underneath a live process is
+worth avoiding. Aplexica snapshots every agent's native files before its first
+write either way, and `aplexica restore-native` puts them back.
+
 Now ask Codex anything:
 
 ```text
@@ -127,6 +134,9 @@ agents.
 | macOS / Linux | Homebrew | Available at 1.0.74; [brew.md](docs/install/brew.md) |
 | Windows 10/11 | Release .zip archive | Available; [windows.md](docs/install/windows.md) |
 | Any | In-place direct update | Not provided — use the installing channel; [update.md](docs/install/update.md) |
+
+Install shell completions for Bash, Zsh, Fish, and PowerShell with the
+[shell completion guide](docs/install/completions.md).
 
 ### Release authentication
 

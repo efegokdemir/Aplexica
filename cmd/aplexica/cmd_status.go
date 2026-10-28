@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -269,6 +270,7 @@ func emitStatus(cmd *cobra.Command, snap StatusSnapshot, asJSON bool) error {
 			snap.DaemonInfo.PID, snap.DaemonInfo.WatchedDir,
 			snap.DaemonInfo.StartedAt.Format(time.RFC3339))
 		renderStorePressure(out, snap.DaemonInfo)
+		renderAdapterBlocks(out, snap.DaemonInfo)
 		renderDeferredMaterializations(out, snap.DaemonInfo)
 		renderSyncSuppressions(out, snap.DaemonInfo)
 	} else {
@@ -348,6 +350,52 @@ func renderStorePressure(out io.Writer, info *daemon.StatusInfo) {
 	}
 }
 
+// renderAdapterBlocks names every adapter the daemon has gated entirely.
+//
+// A blocked adapter neither imports nor receives, so the device syncs
+// nothing for that agent while every other indicator looks healthy: the
+// daemon is running, the agent reads as installed, and its artifact count
+// simply stays at zero. Before this, the only evidence was an ERROR line in
+// the daemon log, which is not where anyone looks first.
+//
+// It is a WARNING because, unlike a routing policy the operator chose, a
+// block is never what they asked for.
+func renderAdapterBlocks(out io.Writer, info *daemon.StatusInfo) {
+	if len(info.AdapterBlocked) == 0 {
+		return
+	}
+	names := make([]string, 0, len(info.AdapterBlocked))
+	for name := range info.AdapterBlocked {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	fmt.Fprintf(out, "  Adapters: WARNING — %d blocked, so %s not syncing at all\n",
+		len(names), plural(len(names), "it is", "they are"))
+	for _, name := range names {
+		fmt.Fprintf(out, "    %s  %s\n", name, info.AdapterBlocked[name])
+		if remedy := adapterBlockRemedy(info.AdapterBlocked[name]); remedy != "" {
+			fmt.Fprintf(out, "      Fix with: %s\n", remedy)
+		}
+	}
+	fmt.Fprintln(out, "    Sync resumes for a blocked agent once its safety snapshot succeeds.")
+}
+
+// adapterBlockRemedy turns a block reason into the exact command that
+// clears it, where one exists.
+//
+// The permissions case is worth naming specifically because it is the
+// default state on any distribution whose login umask is 002 — the agent
+// directory is created 0775, the safety snapshot refuses to copy a
+// group-writable tree, and every such user is blocked on first run. A
+// generic "see the logs" would leave them reading a stack of Go errors to
+// discover they need one chmod.
+func adapterBlockRemedy(reason string) string {
+	if strings.Contains(reason, "unsafe directory permissions") {
+		return "chmod 700 <the agent's directory named above>, then aplexica daemon restart"
+	}
+	return ""
+}
+
 // renderDeferredMaterializations summarizes the native-materialization retry
 // queue under the Daemon line. Pending entries are normal and transient in
 // small numbers; abandoned ones spent their whole retry budget and need an
@@ -356,7 +404,7 @@ func renderDeferredMaterializations(out io.Writer, info *daemon.StatusInfo) {
 	if len(info.DeferredMaterializations) == 0 {
 		return
 	}
-	pending, attention, held := 0, 0, 0
+	pending, attention, held, policy := 0, 0, 0, 0
 	for _, row := range info.DeferredMaterializations {
 		if deferredNeedsAttention(row) {
 			attention++
@@ -365,10 +413,24 @@ func renderDeferredMaterializations(out io.Writer, info *daemon.StatusInfo) {
 		if deferred, _ := row["escalationDeferred"].(bool); deferred {
 			held++
 		}
+		if deferredWithheldByPolicy(row) {
+			policy++
+			continue
+		}
 		pending++
 	}
 	if pending > 0 {
 		fmt.Fprintf(out, "  Materialization: %d pending retr%s\n", pending, plural(pending, "y", "ies"))
+	}
+	if policy > 0 {
+		// Counting these as "pending retries" made a correctly configured
+		// device look broken: every artifact bound for an agent the operator
+		// deliberately left disabled sits in the queue — by design, so it
+		// materializes the moment that agent is enabled — and the queue is the
+		// whole store. Name the cause and the action instead of the backlog.
+		fmt.Fprintf(out, "  Materialization: %d write%s waiting on agents you have not enabled (not an error)\n",
+			policy, plural(policy, "", "s"))
+		fmt.Fprintln(out, "    Enable with: aplexica sync enable <agent>, then aplexica daemon reload")
 	}
 	if held > 0 {
 		// Report the cap's backlog rather than truncating it silently. The cap
@@ -420,6 +482,22 @@ const deferredAttentionListLimit = 10
 func deferredNeedsAttention(row map[string]any) bool {
 	state, _ := row["state"].(string)
 	return state == "needs_attention" || state == "abandoned"
+}
+
+// deferredWithheldByPolicy reports whether a pending write is held by the
+// operator's own configuration rather than by a fault.
+//
+// A policy gate is not a retry in any sense the operator cares about: the
+// write is queued precisely so it lands when the gate opens, and nothing is
+// wrong while it waits. An unrecognized reason classifies as a defect, so a
+// new reason is reported as a real retry until it is catalogued — never
+// hidden.
+func deferredWithheldByPolicy(row map[string]any) bool {
+	reason, _ := row["reason"].(string)
+	if reason == "" {
+		return false
+	}
+	return syncd.SuppressionReason(reason).Class() == syncd.ClassPolicy
 }
 
 // renderSyncSuppressions answers "why is nothing syncing?" directly.

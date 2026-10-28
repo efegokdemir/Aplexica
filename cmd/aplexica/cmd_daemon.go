@@ -2761,19 +2761,52 @@ var daemonStopCmd = &cobra.Command{
 
 var daemonRestartCmd = &cobra.Command{
 	Use:   "restart",
-	Short: "Stop the running daemon and start a fresh one",
-	Long: `Stops the running daemon via the control socket, waits for the
-socket to disappear (the daemon's signal that the process has exited),
-then re-runs ` + "`aplexica daemon start`" + ` with the current invocation's
-flags.
+	Short: "Restart the daemon, through its service manager when one is installed",
+	Long: `Restarts the daemon and waits until it answers on its control socket.
 
-If the daemon isn't running, restart simply starts it. Useful when a
-config change requires daemon-level restart (per the
-restart_required schema field surfaced by SIGHUP / control-socket
-reload).`,
+On Linux and macOS, when the daemon is installed as a service (by
+` + "`aplexica daemon install`" + `, which ` + "`aplexica setup --install`" + ` also runs),
+restart hands the job to that service manager: ` + "`systemctl --user restart`" + `
+on Linux, ` + "`launchctl kickstart -k`" + ` on macOS. The daemon comes back with
+the options recorded in its service definition. To change those, re-run
+` + "`aplexica daemon install`" + ` with the new flags; flags passed to restart do
+not reach a managed daemon.
+
+Otherwise — including on Windows, where the daemon runs from a logon
+Scheduled Task rather than a supervised service — restart stops the
+running daemon over the control socket, waits for it to exit, and starts a
+fresh one in the background. If no daemon is running, it simply starts one.
+
+Either way, restart succeeds only once the daemon is reachable again. If it
+does not answer within ` + restartReadyWait.String() + `, restart exits non-zero and points
+at ` + "`aplexica daemon logs`" + ` instead of reporting a process id that may
+already have exited.
+
+Use it after upgrading the binary, or when ` + "`aplexica daemon reload`" + ` reports
+a setting as restart_required.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		sockPath := filepath.Join(daemonStateDir, "aplexicad.sock")
+
+		// A service manager that owns the daemon must perform the restart
+		// itself. Stopping the process and self-exec'ing a replacement
+		// leaves the manager's unit stopped — systemd reads a clean exit as
+		// success, so Restart=on-failure does not fire — and the
+		// replacement runs unsupervised inside the caller's session scope,
+		// where it dies with the shell. That combination reported a pid
+		// while leaving no daemon running at all.
+		if ctl := daemon.ServiceControllerForPlatform(); ctl != nil && ctl.Managed() {
+			fmt.Fprintf(cmd.OutOrStdout(), "daemon: restarting via %s\n", ctl.Label())
+			if err := ctl.Restart(); err != nil {
+				return err
+			}
+			if !waitForDaemonReady(restartReadyWait) {
+				return fmt.Errorf("daemon: %s accepted the restart but the daemon is not reachable at %s after %s; check `aplexica daemon logs`",
+					ctl.Label(), sockPath, restartReadyWait)
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "daemon: running")
+			return nil
+		}
 
 		// Best-effort stop. Ignore "not running" — restart is also the
 		// happy path for "start fresh."
@@ -2795,14 +2828,46 @@ reload).`,
 		}
 
 		// Re-invoke start via the same machinery the start subcommand uses.
-		return daemonStartCmd.RunE(cmd, args)
+		if err := daemonStartCmd.RunE(cmd, args); err != nil {
+			return err
+		}
+		// `daemon start` reports the pid it spawned, which is not evidence
+		// the daemon survived startup. Confirm it against the socket so a
+		// restart that produced nothing cannot exit 0.
+		if !waitForDaemonReady(restartReadyWait) {
+			return fmt.Errorf("daemon: started, but not reachable at %s after %s; check `aplexica daemon logs`",
+				sockPath, restartReadyWait)
+		}
+		return nil
 	},
+}
+
+// waitForDaemonReady polls the control socket until the daemon answers or
+// the budget runs out. Readiness is the socket responding, never the
+// presence of a pid: a process that exits during startup still had one.
+func waitForDaemonReady(budget time.Duration) bool {
+	deadline := time.Now().Add(budget)
+	for {
+		if daemonAlreadyRunning() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(restartPollInterval)
+	}
 }
 
 // restart timing constants (BRD-03 §4 wedged-daemon recovery).
 const (
 	restartStopWait     = 5 * time.Second
 	restartPollInterval = 50 * time.Millisecond
+	// restartReadyWait bounds the wait for the restarted daemon to answer
+	// on the control socket. It is generous relative to restartStopWait
+	// because startup does real work before it listens — reading the
+	// canonical store and taking native safety snapshots — while a stop is
+	// only a signal and an unlink.
+	restartReadyWait = 90 * time.Second
 )
 
 var daemonLogsCmd = &cobra.Command{
